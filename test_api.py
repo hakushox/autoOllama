@@ -354,7 +354,7 @@ def generate_actions(content, extra_messages=None, similar=None, max_attempts=3)
     if similar:
         print(f"direct_execute: {similar.get('direct_execute')}, score: {similar.get('score', 0)}")
     if similar and similar.get('direct_execute') and similar.get('score', 0) >= 0.75:
-        tts(f'找到曾经执行的案例： 评分{similar.get('score'):.1f}')
+        tts(f'找到曾经执行的案例： 评分{similar.get("score"):.1f}')
         output = similar['output']
         return json.loads(output), output
  
@@ -557,7 +557,7 @@ def correct_text(text):
     if not text:
         return text
     response = ollama.chat(
-            model=olla_models['qwen3.5'],
+            model=olla_models["qwen3.5"],
             messages=[{'role': 'system',                                
                                     'content':f'''你是语音识别结果的校正器。
 输入是Whisper的识别文本，可能有同音字错误、漏字、专有名词识别失误。
@@ -582,7 +582,7 @@ chat_history = []
 MAX_HISTORY = 20
 
 def classify_content(content):
-    print(f'Classifying intent...MODEL: {olla_models['qwen2.5']}')
+    print(f'Classifying intent...MODEL: {olla_models["qwen2.5"]}')
     response = ollama.chat(
         model=olla_models['qwen3.5'],
         messages=[{'role': 'user', 'content': f'''判断意图，只输出一个词：automation/chat/review
