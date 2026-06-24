@@ -10,18 +10,25 @@ import subprocess
 import pyautogui as pg
 import pyperclip
 import re
-from window_utils import open_or_activate, is_running, _find_hwnd
+from window_utils import open_or_activate, is_running
 import time
 from test_ollama_pic import visual_locate
 import platform
 import os
+import types as _types
+_os = _types.ModuleType('os')
+_os.__dict__.update(os.__dict__)
+if not hasattr(_os, 'startfile'):
+    def _startfile(path, operation=None):
+        subprocess.run(['open', str(path)])
+    _os.startfile = _startfile
 from pathlib import Path
 import numpy as np
 from collections import deque
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 import sounddevice as sd
-from faster_whisper import WhisperModel
+import mlx_whisper
 import threading
 from pynput import keyboard
 from prompt_toolkit import prompt
@@ -36,7 +43,7 @@ import datetime
 from openwakeword.model import Model
 
 olla_models = {
-    'gemma': 'gemma4', 'qwen3.5': 'qwen3.5:4b', 'qwen2.5':'qwen2.5vl:7b',
+    'gemma': 'gemma4:e4b-mlx', 'qwen3.5': 'qwen3.5:4b-mlx', 'qwen3.5:9':'qwen3.5:9b-mlx',
 }
 # ollama.chat(model='qwen3:8b', messages=[...], options={'temperature': 0},think=False)
 # model='gemma4',options={'temperature': 0.7, 'top_p': 0.9}
@@ -45,25 +52,96 @@ quit_event = threading.Event()
 
 is_active = threading.Event()
 
-oww_model = Model(wakeword_models=[r'D:\Program Files\Lib\site-packages\openwakeword\resources\models\hello_mercy.onnx',
-        'alexa_v0.1.onnx', 'alexa_v0.1.onnx'], inference_framework='onnx')
-WAKE_WORD = 'hello_mercy' 
-QUIT_WORD = 'alexa_v0.1.onnx'    
+import openwakeword
+
+LOCAL_MODEL_DIR = Path(__file__).parent / 'models'
+PACKAGE_MODEL_DIR = Path(openwakeword.__file__).parent / 'resources' / 'models'
+
+def _wake_model_path(filename):
+    local_path = LOCAL_MODEL_DIR / filename
+    if local_path.exists():
+        return local_path
+    return PACKAGE_MODEL_DIR / filename
+
+oww_model = Model(
+    wakeword_models=[
+        str(_wake_model_path(os.getenv('QUIT_MODEL_FILE', 'alexa_v0.1.onnx'))),
+        str(_wake_model_path(os.getenv('WAKE_MODEL_FILE', 'hello_mercy.onnx'))),
+    ],
+    inference_framework='onnx'
+)
+WAKE_WORD = Path(os.getenv('WAKE_MODEL_FILE', 'hello_mercy.onnx')).stem
+QUIT_WORD = Path(os.getenv('QUIT_MODEL_FILE', 'alexa_v0.1.onnx')).stem
+WAKE_THRESHOLD = float(os.getenv('WAKE_THRESHOLD', '0.5'))
+QUIT_THRESHOLD = float(os.getenv('QUIT_THRESHOLD', '0.9'))
+WAKE_FRAME_SIZE = 1280
+WAKE_DEBUG = os.getenv('WAKE_DEBUG') == '1'
+WAKE_TEST = os.getenv('WAKE_TEST') == '1'
+WAKE_DIAG_SECONDS = float(os.getenv('WAKE_DIAG_SECONDS', '20'))
+WAKE_DEVICE = os.getenv('WAKE_DEVICE')
+WAKE_SAMPLERATE = int(os.getenv('WAKE_SAMPLERATE', '16000'))
+WAKE_RECORD_SECONDS = float(os.getenv('WAKE_RECORD_SECONDS', '0'))
+AUDIO_LOCK = threading.Lock()
+current_output_stream = None
+
+def get_wake_input_device():
+    input_device = int(WAKE_DEVICE) if WAKE_DEVICE is not None and WAKE_DEVICE.isdigit() else WAKE_DEVICE
+    if input_device is None:
+        device_info = sd.query_devices(kind='input')
+    else:
+        device_info = sd.query_devices(input_device, kind='input')
+    return input_device, device_info
 
 last_wake_time = datetime.datetime.min
 
 def wake_word_listener():
+    last_debug_time = 0
+    listener_start_time = datetime.datetime.now().timestamp()
+    print(f'Wake models loaded: {list(oww_model.models.keys())}')
+    if WAKE_DEBUG or WAKE_TEST:
+        print(sd.query_devices())
+    try:
+        input_device, device_info = get_wake_input_device()
+        print(f'Wake input device: {device_info["name"]}')
+    except Exception as e:
+        print(f'Cannot read input device info: {e}')
+        input_device = None
+
     def callback(indata, frames, time, status):
-        audio = (indata[:,0] * 32768).astype(np.int16)
-        prediction = oww_model.predict(audio)
+        nonlocal last_debug_time
+        if status:
+            print(f'Wake-word audio status: {status}')
+
+        try:
+            audio = (indata[:, 0] * 32767).astype(np.int16)
+            prediction = oww_model.predict(audio)
+        except Exception as e:
+            print(f'Wake-word listener error: {e}')
+            return
+
+        wake_score = prediction.get(WAKE_WORD, 0)
+        quit_score = prediction.get(QUIT_WORD, 0)
+
+        should_print_diag = (
+            WAKE_DEBUG
+            or WAKE_TEST
+            or datetime.datetime.now().timestamp() - listener_start_time <= WAKE_DIAG_SECONDS
+        )
+        if should_print_diag:
+            now = datetime.datetime.now().timestamp()
+            if now - last_debug_time >= 0.5:
+                rms = float(np.sqrt(np.mean(audio.astype(np.float32) ** 2)))
+                # print(f'\rwake={wake_score:.3f} quit={quit_score:.3f} rms={rms:.0f}', end='', flush=True)
+                last_debug_time = now
+
         global last_wake_time
-        if prediction[WAKE_WORD] > 0.7 and not is_active.is_set():
+        if wake_score > WAKE_THRESHOLD and not is_active.is_set():
             last_wake_time = datetime.datetime.now()
-            print('检测到唤醒词')
+            print(f'\n检测到唤醒词，得分 {wake_score:.2f}')
             wake_event.set()
-        elif prediction[QUIT_WORD] > 0.9:
+        elif quit_score > QUIT_THRESHOLD:
             diff = (datetime.datetime.now() - last_wake_time).total_seconds()
-            print(f'退出词得分触发，距唤醒{diff:.1f}秒')
+            print(f'\n退出词得分触发，得分 {quit_score:.2f}，距唤醒{diff:.1f}秒')
             if diff > 3:
                 print('检测到退出词')
                 quit_event.set()
@@ -71,10 +149,57 @@ def wake_word_listener():
             #     print('检测到退出词')
             #     quit_event.set()
 
-    with sd.InputStream(samplerate=16000, channels=1, dtype='float32',
-                        blocksize=8000, callback=callback):
-        while True:
-            sd.sleep(100)
+    try:
+        with sd.InputStream(
+            samplerate=WAKE_SAMPLERATE,
+            channels=1,
+            dtype='float32',
+            blocksize=WAKE_FRAME_SIZE,
+            device=input_device,
+            callback=callback,
+        ):
+            print(f'Wake listener started at {WAKE_SAMPLERATE} Hz')
+            while True:
+                sd.sleep(100)
+    except Exception as e:
+        print(f'Wake listener failed to start: {e}')
+        quit_event.set()
+
+def record_wake_sample(seconds=5):
+    input_device, device_info = get_wake_input_device()
+    print(f'Recording {seconds:.1f}s from: {device_info["name"]}')
+    frames = []
+
+    def callback(indata, frame_count, time_info, status):
+        if status:
+            print(f'Record status: {status}')
+        frames.append(indata[:, 0].copy())
+
+    with sd.InputStream(
+        samplerate=WAKE_SAMPLERATE,
+        channels=1,
+        dtype='float32',
+        blocksize=WAKE_FRAME_SIZE,
+        device=input_device,
+        callback=callback,
+    ):
+        sd.sleep(int(seconds * 1000))
+
+    audio_float = np.concatenate(frames)
+    audio_int16 = (audio_float * 32767).astype(np.int16)
+    rms = float(np.sqrt(np.mean(audio_int16.astype(np.float32) ** 2)))
+    out_path = Path('/tmp/wake_debug.wav')
+    sf.write(out_path, audio_int16, WAKE_SAMPLERATE, subtype='PCM_16')
+    print(f'Saved {out_path}, rms={rms:.0f}, samples={len(audio_int16)}')
+
+    oww_model.reset()
+    predictions = oww_model.predict_clip(audio_int16, chunk_size=WAKE_FRAME_SIZE)
+    max_scores = {
+        key: max((float(p.get(key, 0)) for p in predictions), default=0)
+        for key in [WAKE_WORD, QUIT_WORD]
+    }
+    print(f'Offline max scores: {max_scores}')
+    return out_path, max_scores
 
 async def _speak(text, rate='+15%', voice='zh-CN-XiaoyiNeural'):
     communicate = edge_tts.Communicate(text, voice, rate=rate)
@@ -88,16 +213,15 @@ async def _speak(text, rate='+15%', voice='zh-CN-XiaoyiNeural'):
 def tts(text, rate='+15%'):
     text = text.replace('*','~')
     def _run():
-        sd.stop()
         buffer = asyncio.run(_speak(text, rate=rate))
         data, samplerate = sf.read(buffer)
-        sd.play(data, samplerate)
-        sd.wait()
+        play_audio(data, samplerate)
     threading.Thread(target=_run, daemon=True).start()
 
 async def _preload():
     responses = {
         'activated': 'Hello, 我在',
+        'ready': '助手已就绪，按F8手动输入',
         'waiting': '等待唤醒',
         'typing': '请输入你的指令, 使用semicolon来分割多组命令',
         'speaking': '请说出你的指令',
@@ -116,9 +240,32 @@ async def _preload():
 def play_cached(key):
     """直接播放预生成的音频，无网络延迟"""
     data, samplerate = audio_cache[key]
-    sd.stop()
-    sd.play(data, samplerate)
-    sd.wait()
+    play_audio(data, samplerate)
+
+def play_audio(data, samplerate):
+    global current_output_stream
+    with AUDIO_LOCK:
+        audio = np.asarray(data)
+        if audio.ndim == 1:
+            audio = audio.reshape(-1, 1)
+        audio = audio.astype(np.float32, copy=False)
+
+        stream = sd.OutputStream(
+            samplerate=samplerate,
+            channels=audio.shape[1],
+            dtype='float32',
+        )
+        current_output_stream = stream
+        try:
+            with stream:
+                stream.write(audio)
+        finally:
+            current_output_stream = None
+
+def stop_output_audio():
+    with AUDIO_LOCK:
+        if current_output_stream:
+            current_output_stream.abort()
 
 CLIENT_INDEX = 0
 MODEL_INDEX = 0
@@ -166,56 +313,26 @@ def reset_provider():
         print(f'''已重置到{PROVIDERS[CLIENT_INDEX]['client'].base_url} 
               || {PROVIDERS[CLIENT_INDEX]['models'][MODEL_INDEX]}''')
 
-system_prompt = f'''你是控制助手，当前系统：{platform.system()}，用户名：{os.getlogin()}
-给你操作指令中可能会有多个步骤。你要将每个操作步骤输出到一个JSON数组中。
-JSON数组中每个元素是一条操作，不能有任何其他文字！
-## Action类型
-run：打开程序
-{{"action":"run","program":"notepad"}}
-chrome必须带profile：{{"action":"run","program":"chrome"}}
-搜索引擎搜索关键词，搜索URL中文关键词禁止URL编码！
-{{"action":"run","program":"chrome","file":"https://www.baidu.com/s?wd=关键词"}}
-word空白文档：{{"action":"run","program":"winword","file":"/w"}}
-视频播放器：{{"action":"run","program":"potplayer","file":"路径"}}
-系统文件夹（回收站/下载/桌面/此电脑）：{{"action":"run","program":"回收站"}}
-activate：激活已有窗口（不新建），置顶指定程序
-{{"action":"activate","program":"chrome"}}
-操作已打开的程序前必须先activate
-type：输入文字
-{{"action":"type","text":"hello"}}
-hotkey：快捷键
-{{"action":"hotkey","keys":["ctrl","s"]}}
-切换Chrome已有标签时,禁止ctrl+t开新标签切换已有标签必须用ctrl+shift+a,规则：
-[{{"action":"activate","program":"chrome"}},
-{{"action":"hotkey","keys":["ctrl","shift","a"]}},
-{{"action":"sleep","seconds":1}},
-{{"action":"type","text":"关键词"}},
-{{"action":"sleep","seconds":1}},
-{{"action":"hotkey","keys":["enter"]}},{{"action":"sleep","seconds":1}}]
-显示桌面：["win","d"]
-mouseclick：鼠标点击，坐标未知时x/y填null
-{{"action":"mouseclick","button":"left","clicks":1,"x":100,"y":200}}
-mouseclick x/y为null时禁止生成mouseclick ，改用hotkey或type直接操作
-mousescroll：滚动，正数向上负数向下，默认-200
-{{"action":"mousescroll","amount":-200}}
-sleep：等待
-{{"action":"sleep","seconds":2}}
- 
-code：执行Python代码，script必须是字符串数组，每个元素是一行代码
-{{"action":"code","script":["import os","path = 'D:/'","os.startfile(path)"]}}
- 
-unknown：无法完成的指令
-{{"action":"unknown"}}
- 
-## 重要规则
-文件操作：
-- 新建任何文件必须用code，不能用run的file参数
-- 桌面路径：os.path.expanduser('~/Desktop')
-- 新建docx必须用python-docx的Document()不带参数，再save(path)
-- 搜索文件有明确条件时直接匹配打开，无需列出让用户选
-- Windows路径用'D:/'或'D:\\\\'，禁止用r'D:\\'
-打开程序路径不确定时，先用Path.glob搜索C盘和D盘，找到再打开：
-用户说"打开欧路词典"，输出：
+_IS_MAC = platform.system() == 'Darwin'
+_MODIFIER = 'cmd' if _IS_MAC else 'ctrl'
+_OPEN_FILE_RULE = (
+    "- 打开文件/文件夹必须用subprocess.run(['open', path])，禁止os.startfile()"
+    if _IS_MAC else
+    "- 打开文件/文件夹用os.startfile(path)"
+)
+_FIND_APP_EXAMPLE = (
+    '''用户说"打开欧路词典"，输出：
+[{{"action":"code","script":[
+  "import subprocess",
+  "result = subprocess.run(['mdfind', '-name', 'Eudic'], capture_output=True, text=True)",
+  "paths = [p for p in result.stdout.strip().splitlines() if p.endswith('.app')]",
+  "if paths:",
+  "    subprocess.run(['open', paths[0]])",
+  "else:",
+  "    print('未找到')"
+]}}]'''
+    if _IS_MAC else
+    '''用户说"打开欧路词典"，输出：
 [{{"action":"code","script":[
   "from pathlib import Path",
   "import os",
@@ -224,14 +341,145 @@ unknown：无法完成的指令
   "    os.startfile(str(results[0]))",
   "else:",
   "    print('未找到')"
-]}}]
- 
+]}}]'''
+)
+_FOLDER_EXAMPLE = (
+    '''用户说"打开下载文件夹，问我要打开哪个"，输出：
+[{{"action":"code","script":[
+  "import os, subprocess",
+  "path = os.path.expanduser('~/Downloads')",
+  "subprocess.run(['open', path])",
+  "files = os.listdir(path)",
+  "for i, f in enumerate(files):",
+  "    print(f'{{i}}. {{f}}')",
+  "choice = input('请输入序号或文件名：')",
+  "if choice.isdigit():",
+  "    target = files[int(choice)]",
+  "else:",
+  "    matches = [f for f in files if choice.lower() in f.lower()]",
+  "    target = matches[0] if matches else None",
+  "if target:",
+  "    subprocess.run(['open', os.path.join(path, target)])",
+  "else:",
+  "    print('未找到匹配文件')"
+]}}]'''
+    if _IS_MAC else
+    '''用户说"打开E盘video文件夹，问我要打开哪个"，输出：
+[{{"action":"code","script":[
+  "import os",
+  "path = 'E:/video'",
+  "os.startfile(path)",
+  "files = os.listdir(path)",
+  "for i, f in enumerate(files):",
+  "    print(f'{{i}}. {{f}}')",
+  "choice = input('请输入序号或文件名：')",
+  "if choice.isdigit():",
+  "    target = files[int(choice)]",
+  "else:",
+  "    matches = [f for f in files if choice.lower() in f.lower()]",
+  "    target = matches[0] if matches else None",
+  "if target:",
+  "    os.startfile(os.path.join(path, target))",
+  "else:",
+  "    print('未找到匹配文件')"
+]}}]'''
+)
+_RUN_EXAMPLES = (
+    f'''run：打开程序（macOS用app名称，不带.exe）
+{{"action":"run","program":"textedit"}}
+chrome必须带profile：{{"action":"run","program":"chrome"}}
+搜索引擎搜索关键词，搜索URL中文关键词禁止URL编码！
+{{"action":"run","program":"chrome","file":"https://www.baidu.com/s?wd=关键词"}}
+系统文件夹（垃圾箱/下载/桌面）：{{"action":"run","program":"trash"}}'''
+    if _IS_MAC else
+    f'''run：打开程序
+{{"action":"run","program":"notepad"}}
+chrome必须带profile：{{"action":"run","program":"chrome"}}
+搜索引擎搜索关键词，搜索URL中文关键词禁止URL编码！
+{{"action":"run","program":"chrome","file":"https://www.baidu.com/s?wd=关键词"}}
+word空白文档：{{"action":"run","program":"winword","file":"/w"}}
+视频播放器：{{"action":"run","program":"potplayer","file":"路径"}}
+系统文件夹（回收站/下载/桌面/此电脑）：{{"action":"run","program":"回收站"}}'''
+)
+_CHROME_TAB = (
+    f'''切换Chrome已有标签时,禁止cmd+t开新标签，切换已有标签必须用cmd+shift+a,规则：
+[{{"action":"activate","program":"chrome"}},
+{{"action":"hotkey","keys":["cmd","shift","a"]}},
+{{"action":"sleep","seconds":1}},
+{{"action":"type","text":"关键词"}},
+{{"action":"sleep","seconds":1}},
+{{"action":"hotkey","keys":["enter"]}},{{"action":"sleep","seconds":1}}]
+显示桌面：["cmd","mission_control"]（或用三指上划手势）'''
+    if _IS_MAC else
+    f'''切换Chrome已有标签时,禁止ctrl+t开新标签切换已有标签必须用ctrl+shift+a,规则：
+[{{"action":"activate","program":"chrome"}},
+{{"action":"hotkey","keys":["ctrl","shift","a"]}},
+{{"action":"sleep","seconds":1}},
+{{"action":"type","text":"关键词"}},
+{{"action":"sleep","seconds":1}},
+{{"action":"hotkey","keys":["enter"]}},{{"action":"sleep","seconds":1}}]
+显示桌面：["win","d"]'''
+)
+_FINAL_EXAMPLE = (
+    f'''示例：
+用户说"打开文本编辑然后输入hello"，输出：
+[{{"action":"run","program":"textedit"}},{{"action":"sleep","seconds":2}},{{"action":"type","text":"hello"}}]
+
+单条指令也必须用数组包裹：
+[{{"action":"run","program":"textedit"}}]'''
+    if _IS_MAC else
+    f'''示例：
+用户说"打开记事本然后输入hello"，输出：
+[{{"action":"run","program":"notepad"}},{{"action":"sleep","seconds":2}},{{"action":"type","text":"hello"}}]
+
+单条指令也必须用数组包裹：
+[{{"action":"run","program":"notepad"}}]'''
+)
+
+system_prompt = f'''你是控制助手，当前系统：{platform.system()}，用户名：{os.getlogin()}
+给你操作指令中可能会有多个步骤。你要将每个操作步骤输出到一个JSON数组中。
+JSON数组中每个元素是一条操作，不能有任何其他文字！
+## Action类型
+{_RUN_EXAMPLES}
+activate：激活已有窗口（不新建），置顶指定程序
+{{"action":"activate","program":"chrome"}}
+操作已打开的程序前必须先activate
+type：输入文字
+{{"action":"type","text":"hello"}}
+hotkey：快捷键（macOS用cmd代替ctrl）
+{{"action":"hotkey","keys":["{_MODIFIER}","s"]}}
+{_CHROME_TAB}
+mouseclick：鼠标点击，坐标未知时x/y填null
+{{"action":"mouseclick","button":"left","clicks":1,"x":100,"y":200}}
+mouseclick x/y为null时禁止生成mouseclick ，改用hotkey或type直接操作
+mousescroll：滚动，正数向上负数向下，默认-200
+{{"action":"mousescroll","amount":-200}}
+sleep：等待
+{{"action":"sleep","seconds":2}}
+
+code：执行Python代码，script必须是字符串数组，每个元素是一行代码
+{{"action":"code","script":["import subprocess","subprocess.run(['open', '/path/to/file'])"]}}
+
+unknown：无法完成的指令
+{{"action":"unknown"}}
+
+## 重要规则
+文件操作：
+- 新建任何文件必须用code，不能用run的file参数
+- 桌面路径：os.path.expanduser('~/Desktop')
+- 下载路径：os.path.expanduser('~/Downloads')
+- 新建docx必须用python-docx的Document()不带参数，再save(path)
+- 搜索文件有明确条件时直接匹配打开，无需列出让用户选
+{_OPEN_FILE_RULE}
+打开路径不确定的程序时，先搜索再打开：
+{_FIND_APP_EXAMPLE}
+
 代码规范：
 - script是字符串数组，每个元素是一行，缩进用空格写在字符串里
 - 多步操作能合并时写成一个code
 - if/for/while等块语句缩进必须正确
 - next()查找时必须提供默认值：next((x for x in ...), None)，禁止直接next(generator)
- 
+
 网页操作（两步走）：
 第一步：sync_playwright打开页面，遍历frame抓取input/button/a元素赋值给_result，禁止browser.close(),script里禁止import sync_playwright，它已在执行环境中可直接使用
 {{"action":"code","script":[
@@ -261,36 +509,12 @@ unknown：无法完成的指令
 ]}}
 第二步：主程序传回_result，根据真实元素生成fill/click操作
 禁止使用async_playwright和asyncio，禁止用requests抓取网页
- 
+
 需要问用户输入才能继续的操作，用input()写在script里。
- 
-用户说"打开E盘video文件夹，问我要打开哪个"，输出：
-[{{"action":"code","script":[
-  "import os",
-  "path = 'E:/video'",
-  "os.startfile(path)",
-  "files = os.listdir(path)",
-  "for i, f in enumerate(files):",
-  "    print(f'{{i}}. {{f}}')",
-  "choice = input('请输入序号或文件名：')",
-  "if choice.isdigit():",
-  "    target = files[int(choice)]",
-  "else:",
-  "    matches = [f for f in files if choice.lower() in f.lower()]",
-  "    target = matches[0] if matches else None",
-  "if target:",
-  "    os.startfile(os.path.join(path, target))",
-  "else:",
-  "    print('未找到匹配文件')"
-]}}]
- 
-示例：
-用户说"打开记事本然后输入hello"，输出：
-[{{"action":"run","program":"notepad"}},{{"action":"sleep","seconds":2}},{{"action":"type","text":"hello"}}]
- 
-单条指令也必须用数组包裹：
-[{{"action":"run","program":"notepad"}}]
- 
+
+{_FOLDER_EXAMPLE}
+
+{_FINAL_EXAMPLE}
 '''
 
 EXAMPLES_FILE = Path(__file__).parent / 'ollama/examples.json'
@@ -479,23 +703,18 @@ waiting_input.clear()
 
 def on_press(key):
     if key == keyboard.Key.space:
-        sd.stop()
+        stop_output_audio()
     if key == keyboard.Key.f8:
         if not waiting_input.is_set():
             print('正在切换为手动输入模式...')
             waiting_input.set() #is_set() 返回 True
-            sd.stop()
+            stop_output_audio()
 
-
-# def on_release(key):
-#     if key == keyboard.Key.f9:
-#         waiting_input.clear()  #is_set() 返回 False
 
 def listen():
     while not start_recording.is_set():  # 等F9按下
         time.sleep(0.05)
     frames =[]
-    display_text = ['']
     stop_event = threading.Event()
 
     def transcribe_loop():
@@ -505,10 +724,10 @@ def listen():
             if not frames:
                 continue
             audio = np.concatenate(frames).squeeze()
-            segments, _ = model.transcribe(audio, language='zh', vad_filter=True,
+            result = mlx_whisper.transcribe(audio, language='zh',
+                path_or_hf_repo='mlx-community/whisper-large-v3-turbo',
                 initial_prompt='E盘, 海豹, 网易云，百度, baidu, gmail, 桌面...')
-            text = ''.join(seg.text for seg in segments)
-            display_text[0] = text
+            text = ''.join(seg['text'] for seg in result['segments'])
             elapsed = time.time() - start
             print(f'\rRecording...{elapsed:.1f}秒。识别中：{text}', end='', flush=True)
 
@@ -537,9 +756,10 @@ def listen():
         return ''
     
     audio = np.concatenate(frames).squeeze()
-    segments, _ = model.transcribe(audio, language='zh', vad_filter=True,
+    result = mlx_whisper.transcribe(audio, language='zh',
+        path_or_hf_repo='mlx-community/whisper-large-v3-turbo',
         initial_prompt='E盘, 海豹, 网易云，百度, baidu, gmail, 桌面...')
-    text = ''.join(seg.text for seg in segments)
+    text = ''.join(seg['text'] for seg in result['segments'])
 
     # 去掉结束关键词
     for keyword in ['发送', 'over', 'send', '完成', 'ok']:
@@ -556,6 +776,7 @@ start_recording = threading.Event()  #模块级别的变量
 def correct_text(text):
     if not text:
         return text
+    print(f'correcting text...MODEL: {olla_models["qwen3.5"]}')
     response = ollama.chat(
             model=olla_models["qwen3.5"],
             messages=[{'role': 'system',                                
@@ -570,7 +791,7 @@ E盘可能会被识别成一盘，类似这种谐音识别错误，你需要修�
 4. 只输出修正后的文本，不要任何解释
 5. 你只校正，禁止回答任何问题'''}, 
                         {'role': 'user', 'content': text}],
-                        options={'temperature': 0.3})
+                        options={'temperature': 0.3}, think=False)
     print('=' * 30 + f'当前模型:{response.model}' + '='* 30)
     return response.message.content.strip()
 
@@ -582,7 +803,7 @@ chat_history = []
 MAX_HISTORY = 20
 
 def classify_content(content):
-    print(f'Classifying intent...MODEL: {olla_models["qwen2.5"]}')
+    print(f'Classifying intent...MODEL: {olla_models["qwen3.5"]}')
     response = ollama.chat(
         model=olla_models['qwen3.5'],
         messages=[{'role': 'user', 'content': f'''判断意图，只输出一个词：automation/chat/review
@@ -592,7 +813,7 @@ chat：普通聊天或问问题
 review：讨论或修改刚才执行过的自动化操作
 除非十分明确要chat或review,否则都是automation!
 "{content}"'''}],
-        options={'temperature': 0,'think': False},
+        options={'temperature': 0}, think=False,
     )
 
     result = response.message.content.strip().lower()
@@ -654,19 +875,17 @@ def chat_mode(content, with_context=False):
     tts(reply)
 
 PROGRAMS = {
-    '网易云音乐': r'"D:\Program Files (x86)\网易云音乐PC版\cloudmusic.exe"',
-    'chrome':  r'C:\Program Files\Google\Chrome\Application\chrome.exe',  
-    'potplayer':  r"D:\Program Files\DAUM\PotPlayer\PotPlayerMini64.exe", 
-    'winword': r"C:\Program Files (x86)\Microsoft Office\root\Office16\WINWORD.EXE",
-    'powerpoint': r"C:\Program Files (x86)\Microsoft Office\root\Office16\POWERPNT.EXE",
-    'qq音乐': r"E:\Program Files (x86)\tencent\qqmusic\QQMusic.exe",
-    '此电脑': 'explorer.exe',
-    '回收站': 'explorer.exe shell:RecycleBinFolder',
-    '下载': 'explorer.exe shell:Downloads',
-    '桌面': 'explorer.exe shell:Desktop',
-    '文档': 'explorer.exe shell:Personal',
-    '图片': 'explorer.exe shell:My Pictures',
-            }
+    'chrome': 'Google Chrome',
+    '网易云音乐': 'NeteaseMusic',
+    'qq音乐': 'QQMusic',
+    'word': 'Microsoft Word',
+    'powerpoint': 'Microsoft PowerPoint',
+    '废纸篓': os.path.expanduser('~/.Trash'),
+    '下载': os.path.expanduser('~/Downloads'),
+    '桌面': os.path.expanduser('~/Desktop'),
+    '文档': os.path.expanduser('~/Documents'),
+    '图片': os.path.expanduser('~/Pictures'),
+}
 ACCOUNTS = {
      '126': {
         'keywords': ['126', '126邮箱', '网易邮箱'],
@@ -688,8 +907,17 @@ ACCOUNTS = {
 }
 
 if __name__ == '__main__':
+    if WAKE_RECORD_SECONDS > 0:
+        print('Wake record mode. Say the wake word during the recording window.')
+        record_wake_sample(WAKE_RECORD_SECONDS)
+        exit()
+
+    if WAKE_TEST:
+        print('Wake test mode. Say the wake word, or press Ctrl+C to stop.')
+        wake_word_listener()
+
     print('正在加载Whisper model...')
-    model = WhisperModel('large-v3-turbo', device='cuda', compute_type='float16')
+    mlx_whisper.transcribe(np.zeros(16000, dtype=np.float32), path_or_hf_repo='mlx-community/whisper-large-v3-turbo')
 
     # 启动时调用一次
     audio_cache = asyncio.run(_preload())
@@ -698,7 +926,7 @@ if __name__ == '__main__':
 
     listener = keyboard.Listener(on_press=on_press, on_release=None)
     listener.start()
-    tts('助手已就绪，按F9手动输入', rate='+50%')
+    play_cached('ready')
 
     last_active_time = time.time()
 
@@ -796,19 +1024,18 @@ if __name__ == '__main__':
 
             last_coords = None
             last_program = None
+
             persistent_namespace = {'user_input': content, '__file__': __file__,
                                     'BeautifulSoup': BeautifulSoup,
                                     'sync_playwright': sync_playwright,
                                     'ACCOUNTS': ACCOUNTS,
-                                        'os': os,
+                                    'os': _os,
                                     'Path': Path,
                                     'subprocess': subprocess,
                                     'time': time,
                                     'json': json,
                                     're': re,
                                     }
-            auto_execute = False
-
             queue = deque(datas)
             exec_retry = 0
 
@@ -816,44 +1043,34 @@ if __name__ == '__main__':
                 data = queue.popleft()
                 if data['action'] == 'run':
                     app_name = data['program'].replace('.exe', '').lower().strip()
-                    program = app_name
+                    program = PROGRAMS.get(app_name)
                     for key in PROGRAMS:
                         if key in app_name or app_name in key:
                             program = PROGRAMS[key]
                             break
-                                                
+
                     args = data.get('file', '')
-                    if args:
-                        subprocess.Popen(f'"{program}" "{args}"', shell=True)
-                    elif app_name == 'explorer' or '此电脑' in app_name:
-                        subprocess.Popen(program, shell=True)
-                    elif app_name == 'chrome':
-                        # --remote-debugging-port=9222 允许Playwright通过connect_over_cdp连接已有Chrome
-                        # --new-window 每次新开窗口而不是新标签
-                        # --profile-directory=Default 使用默认用户配置，保持登录状态
-                        subprocess.Popen(
-                            f'"{PROGRAMS["chrome"]}" --remote-debugging-port=9222 --new-window --profile-directory=Default',
-                            shell=True
-                        )
-                    elif is_running(app_name):
-                        open_or_activate(Path(program).name, program)
+                    if app_name == 'chrome':
+                        chrome_args = ['open', '-a', 'Google Chrome', '--args',
+                                       '--remote-debugging-port=9222',
+                                       '--profile-directory=Default']
+                        if args:
+                            chrome_args.append(args)
+                        subprocess.Popen(chrome_args)
+                    elif args:
+                        subprocess.run(['open', args])
+                    elif program and program.startswith('/'):
+                        subprocess.run(['open', program])
+                    elif program:
+                        subprocess.run(['open', '-a', program])
                     else:
-                        subprocess.Popen(program, shell=True)
-                    last_program = program
-                    timeout = 10
-                    start = time.time()
-                    while not _find_hwnd(app_name):
-                        if time.time() - start > timeout:
-                            break
-                        time.sleep(0.3)
+                        subprocess.run(['open', '-a', app_name])
+                    last_program = program or app_name
                     print(last_program)
                 elif data['action'] == 'type':
-                    # if last_program:
-                    #     time.sleep(0.3)
-                    #     open_or_activate(Path(last_program).name, last_program)
                     if any('\u4e00' <= c <= '\u9fff' for c in data['text']):
                         pyperclip.copy(data['text'])
-                        pg.hotkey('ctrl', 'v')
+                        pg.hotkey('cmd', 'v')
                     else:
                         pg.write(data['text'], interval=0.1)
                 elif data['action'] == 'activate':
@@ -863,9 +1080,6 @@ if __name__ == '__main__':
                     time.sleep(1)
                     last_program = program
                 elif data['action'] == 'hotkey':
-                    # if last_program:
-                    #     open_or_activate(Path(last_program).name, last_program)
-                    #     time.sleep(0.3)
                     pg.hotkey(*data['keys'])
 
                 elif data['action'] == 'visual_locate':
@@ -893,9 +1107,6 @@ if __name__ == '__main__':
                     print(f'准备执行代码： \n{script}')
                     play_cached('execute_inquiry')
                     confirm = prompt('是否执行此次代码(y/n)？')
-                    # print('是否执行？按F9说yes或no')
-                    # confirm = listen()
-                    # confirm = 'y' if 'yes' in confirm.lower() or '是' in confirm or '确认' in confirm else 'n'
                     if confirm.lower() == 'y':
                         try:
                             play_cached('executing')
@@ -905,8 +1116,8 @@ if __name__ == '__main__':
                                 print('Chrome未启动调试端口，正在重启...')
                                 tts('Chrome未启动调试端口，正在重启...')
                                 subprocess.Popen(
-                                    f'"{PROGRAMS["chrome"]}" --remote-debugging-port=9222 --profile-directory=Default',
-                                    shell=True
+                                    ['open', '-a', 'Google Chrome', '--args',
+                                     '--remote-debugging-port=9222', '--profile-directory=Default']
                                 )
                                 time.sleep(3)  # 等Chrome启动
                                 queue.extendleft(reversed([data]))
@@ -932,7 +1143,6 @@ if __name__ == '__main__':
                             result = persistent_namespace.pop('_result', None)
                             if result and result != 'unknown_site':
                                 print(result[:3000])
-                                auto_execute = True
                                 next_prompt = f'''用户原始指令：{content}
         页面元素列表（格式为 选择器 type=类型 (说明) frame=所在frame地址）：
         {result}
@@ -947,7 +1157,6 @@ if __name__ == '__main__':
                                 if new_datas:
                                     queue.extendleft(reversed(new_datas))
                             elif result == 'unknown_site':
-                                auto_execute = True
                                 next_prompt = f'''用户原始指令：{content}
         page对象已存在但页面为空，绝对不能调用sync_playwright()或launch()。
         请根据指令判断目标网站登录页url，生成Playwright脚本：
@@ -964,9 +1173,6 @@ if __name__ == '__main__':
             if not similar:
                 tts('想保存本次执行结果吗？')
                 save = prompt('保存本次结果？（y/n）')
-                # print('是否保存本次执行？按F9说yes或no')
-                # save = listen()
-                # save = 'y' if 'yes' in save.lower() or '是' in confirm or '确认' in confirm else 'n'
                 if save.lower() == 'y':
                     save_examples(content, datas)
                     tts('已保存本次执行结果')
@@ -975,4 +1181,3 @@ if __name__ == '__main__':
                                 'role': 'system',
                                 'content': f'用户执行了指令：{content}\n生成的动作：{json.dumps(datas, ensure_ascii=False)}'
                             })
-

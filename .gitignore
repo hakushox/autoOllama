@@ -1,4 +1,5 @@
 __pycache__/
+**/__pycache__/
 *.pyc
 .venv/
 venv/
@@ -6,3 +7,6 @@ venv/
 .vscode/
 .idea/
 *.log
+API_KEY.py
+.DS_Store
+ollama/examples.json
