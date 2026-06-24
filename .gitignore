@@ -9,4 +9,4 @@ venv/
 *.log
 API_KEY.py
 .DS_Store
-ollama/examples.json
+
